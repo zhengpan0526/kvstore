@@ -1,43 +1,45 @@
 # KVStore
+一个类 Redis 的 C 语言 KV 引擎，覆盖协议解析、命令执行、存储引擎、持久化、复制与压测链路。项目重点不是“单点功能”，而是把协议→存储→AOF/RDB→主从同步→性能工程串成可讨论的系统实现。
 
-一个类 Redis 的 C 语言 KV 引擎。覆盖 RESP 协议解析、存储引擎、AOF/RDB 持久化、TCP/eBPF 主从同步与压测对齐。
+## 项目展示
+- 协议与会话：RESP 状态机 + 半包处理 +单连接批量命令处理（`src/network/resp_protocol.c`, `src/network/net_session.c`）。
+- 低锁并发组件设计：基于原子变量的环形消息队列（SPSC push + CAS pop），用于复制后端解耦（`src/utils/msg_queue.c`, `src/distributed/sync_backend_tcp.c`）。
+- 网络缓冲区抽象：自定义 `netbuf` 统一收发缓冲、扩容、前裁剪，承接 Pipeline 与粘拆包（`src/utils/netbuf.c`, `src/network/net_session.c`）。
+- 可切换内存后端：`pool/system/jemalloc` 三后端统一接口，便于性能与内存占用对比（`src/storage/kvs_mempool.c`, `src/storage/jemalloc_wrapper.c`）。
+- 写路径一致性边界：写命令执行成功后进入 AOF，再进入主从增量同步，且加载/回放场景做防重复处理（`src/core/kvstore.c`, `src/persistence/kvs_aof.c`, `src/distributed/distributed.c`）。
+- 持久化工程：AOF append/load + 后台 rewrite，配合 RDB snapshot/load 提供恢复路径（`src/persistence/kvs_aof.c`, `src/persistence/kvs_aof_rewrite.c`, `src/persistence/kvs_rdb.c`）。
+- 复制链路工程：TCP 全量+增量同步，另有 eBPF 抓包转发链路（可选）与批处理发送（`src/distributed/*.c`, `src/eBPF/ebpf_syncd.c`）。
+- 性能评估闭环：统一脚本对比 KVStore/Redis，覆盖 set/get、pipeline 与结果汇总（`scripts/bench_all.sh`, `scripts/kvstore_resp_bench.py`, `results/summary.md`）。
 
-## 主要内容
-- 端到端工程闭环：协议解析 → 命令分发 → 存储执行 → 持久化/复制。
-- 存储抽象能力：统一命令框架下实现 `array/rbtree/hash/skiptable`。
-- 一致性边界设计：写命令成功后再进入 AOF 与复制。
-- 复制工程能力：`sync_mode=tcp|ebpf` 双后端，覆盖全量+增量同步。
-- 健壮性处理：RESP 半包继续收包、非法包快速失败。
-- 并发隔离能力：线程局部复制上下文 + slave 只读保护。
-- 性能方法论：同口径对齐 Redis + 自定义负载与内存后端对比。
+## 架构总览
+Client 请求进入网络层（Reactor/Proactor/NtyCo），先进入 RESP 解析器做协议对齐与命令切分。  
+解析后进入命令分发与参数校验，再路由到 array/rbtree/hash/skiptable 等存储实现。  
+写命令成功后按边界进入 AOF 追加，并由主节点编码为复制消息广播到从节点。  
+从节点按复制协议回放写操作，并在只读策略下隔离外部写请求。  
+读写响应统一走会话发送缓冲，支持 pipeline 场景下的批量应答。
 
-## 架构概览
-主链路：`Client -> RESP Parser -> Dispatch -> Storage -> Reply`。  
-写命令成功后进入 `AOF append/replay`，再进入复制通道。  
-复制层支持 `TCP` 与 `eBPF` 两种同步后端。  
-存储层为 `array/rbtree/hash/skiptable` 四种实现。  
-内存后端支持 `pool/system/jemalloc` 切换。  
-详细架构图与时序见 `README.dev.md` / `docs/`。
 
-## 设计与工程亮点
-- 一致性边界：仅在写执行成功后触发 AOF 与同步，避免无效写传播。
-- 复制上下文隔离：线程局部上下文区分外部请求与复制回放，保证 slave 只读边界。
-- RESP 半包处理：`0` 表示数据不足继续收包，`-1` 表示协议错误快速失败。
-- 复制并发保护：slave 连接由互斥锁与 `max_slaves` 控制，防止连接风暴。
-- AOF/rewrite：覆盖加载重放与重写路径，平衡恢复正确性和运行期开销。
-- eBPF 批处理：聚合同步消息后发送，降低 syscall 并提升同步吞吐。
+## 设计取舍
+- RESP 半包与错误快速失败：`resp_peek_command` 与 `resp_parser` 区分“不完整包(0)”和“协议错误(-1)”，避免状态机污染（`src/network/resp_protocol.c`）。
+- 写后 AOF + 复制边界：写命令成功后追加 AOF，再按上下文决定是否复制，减少回放重复与环路同步（`src/core/kvstore.c`）。
+- slave 只读与回放隔离：用 `__thread sync_context` 区分普通请求/复制上下文，既保证只读策略又允许回放写入（`src/core/kvstore.c`, `src/network/reactor.c`, `src/network/proactor.c`）。
+- AOF rewrite 细节：后台重写线程、rewrite buffer、快照保护与落盘路径分离（`src/persistence/kvs_aof_rewrite.c`）。
+- RANGE/SORT 跨结构统一语义：命令层统一参数校验和分发，底层按结构实现 range/sort，便于讨论复杂度与一致性（`src/core/kvs_operation.c`）。
+- 队列+批处理发送：复制消息先入队再异步发送；eBPF 路径叠加 `tx_batcher` 降低小包发送开销（`src/utils/msg_queue.c`, `src/utils/tx_batcher.c`, `src/eBPF/ebpf_syncd.c`）。
 
-## 性能说明
-- 对齐 Redis 的压测显示：`rbtree/hash/skiptable` 已进入高吞吐区间，差距明显收敛。
-- 当前主要瓶颈在 `array` 路径。
-- TCP 同步吞吐损耗较小；eBPF 链路在启用批处理后较无批处理有显著提升。
-- `pool/system/jemalloc` 在吞吐与内存占用上存在可观测差异。
-- 完整压测方法与原始数据见 `README.dev.md`。
+## 性能说明（简要）
+- 在当前样例结果中，hash/rbtree/skiptable 的 set/get 吞吐明显高于 array 路径，瓶颈分布具有结构差异。  
+- 压测脚本保证 kvstore 与 Redis 的请求参数口径一致，便于横向比较。  
+- 详细过程、参数与结果解释见 `README.dev.md` 的性能章节与 `results/summary.md`。
 
-## 仓库使用说明
-- 本仓库定位为“工程核心代码节选 + 设计文档”。
-- 重点体现架构取舍、关键链路和性能方法。
-- 面试可现场演示并讲解核心链路（协议解析、写路径、持久化与主从同步）。
+## 面试阅读指南
+- 这是“核心代码节选 + 实验文档”仓库，目标是展示系统工程能力，不承诺开箱即用的完整生产部署环境。
+- 建议面试官按以下顺序阅读：
+  - `src/core/kvstore.c`（写路径边界、复制与持久化挂接点）
+  - `src/network/net_session.c` + `src/network/resp_protocol.c`（协议解析/半包/pipeline）
+  - `src/persistence/kvs_aof.c` + `src/persistence/kvs_aof_rewrite.c`（AOF 主链路与重写）
+  - `src/distributed/distributed.c` + `src/distributed/sync_backend_tcp.c`（主从同步）
+  - `src/storage/kvs_mempool.c` + `src/utils/netbuf.c`（基础组件能力）
 
-## 更多细节
-详见 `README.dev.md` / `docs/`。
+## 更多资料
+- 详细设计与长文档：`README.dev.md`
